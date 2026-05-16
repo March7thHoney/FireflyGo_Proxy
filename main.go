@@ -39,18 +39,26 @@ func main() {
 	}
 	addr := ":" + port
 	proxyAddr := "127.0.0.1"
+	proxyEnabled := false
 
 	defer func() {
 		if r := recover(); r != nil {
 			zlog.Error().
 				Interface("panic", r).
-				Msg("Unexpected panic, resetting system proxy")
-
-			setProxy(false, "", "")
+				Msg("Unexpected panic")
+		}
+		if proxyEnabled {
+			if err := setProxy(false, "", ""); err != nil {
+				zlog.Error().Err(err).Msg("Failed to reset system proxy")
+			}
 		}
 	}()
 
-	setProxy(true, proxyAddr, port)
+	if err := setProxy(true, proxyAddr, port); err != nil {
+		zlog.Error().Err(err).Msg("Failed to set system proxy")
+		return
+	}
+	proxyEnabled = true
 
 	customCaMitm := &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(cert)}
 	var customAlwaysMitm goproxy.FuncHttpsHandler = func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
@@ -122,6 +130,7 @@ func main() {
 	}
 
 	stop := make(chan os.Signal, 1)
+	serverErr := make(chan error, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	if *exePath != "" && exists(*exePath) {
 		go func() {
@@ -142,15 +151,19 @@ func main() {
 			Str("ExePath", *exePath).
 			Msg("Proxy started")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			zlog.Fatal().Err(err).Msg("ListenAndServe failed")
+			serverErr <- err
 		}
 	}()
 
-	<-stop
+	select {
+	case <-stop:
+	case err := <-serverErr:
+		zlog.Error().Err(err).Msg("ListenAndServe failed")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		zlog.Error().Err(err).Msg("Server shutdown error")
 	}
-	setProxy(false, "", "")
 }
