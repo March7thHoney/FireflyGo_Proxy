@@ -19,14 +19,47 @@ import (
 
 var ENV_CONFIG = make([]string, 0)
 
+func rawQueryFromRequestURI(requestURI string) string {
+	queryStart := strings.IndexByte(requestURI, '?')
+	if queryStart == -1 {
+		return ""
+	}
+
+	rawQuery := requestURI[queryStart+1:]
+	if fragmentStart := strings.IndexByte(rawQuery, '#'); fragmentStart != -1 {
+		rawQuery = rawQuery[:fragmentStart]
+	}
+	return rawQuery
+}
+
 func main() {
 	redirectHost := flag.String("r", "127.0.0.1:21000", "redirect target host")
 	blockedStr := flag.String("b", "", "comma separated list of blocked ports")
+	proxyPort := flag.Int("p", 0, "proxy listen port (default: auto)")
 	exePath := flag.String("e", "", "path to the executable")
 	flag.Parse()
 
+	relaunched, err := relaunchWithAdminIfNeeded()
+	if err != nil {
+		zlog.Error().Err(err).Msg("Failed to relaunch with admin privileges")
+		return
+	}
+	if relaunched {
+		zlog.Info().Msg("Relaunched with admin privileges")
+		return
+	}
+
 	blockedPorts := parseBlockedPorts(*blockedStr)
-	port := findFreePort(blockedPorts)
+	port := ""
+	if *proxyPort != 0 {
+		if *proxyPort < 1 || *proxyPort > 65535 {
+			zlog.Error().Int("port", *proxyPort).Msg("Invalid proxy port")
+			return
+		}
+		port = fmt.Sprint(*proxyPort)
+	} else {
+		port = findFreePort(blockedPorts)
+	}
 	if port == "-1" {
 		zlog.Error().Str("port", port).Msg("No free port available")
 		return
@@ -39,6 +72,7 @@ func main() {
 	}
 	addr := ":" + port
 	proxyAddr := "127.0.0.1"
+	proxyEndpoint := proxyAddr + ":" + port
 	proxyEnabled := false
 
 	defer func() {
@@ -84,6 +118,10 @@ func main() {
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		host := req.URL.Hostname()
 		path := req.URL.Path
+		rawQuery := req.URL.RawQuery
+		if rawQuery == "" {
+			rawQuery = rawQueryFromRequestURI(req.RequestURI)
+		}
 
 		if matchDomain(host, AlwaysIgnoreDomains) {
 			return req, nil
@@ -101,18 +139,31 @@ func main() {
 				)
 			}
 			full := req.URL.String()
-			if matchURL(full, ForceRedirectOnUrlContains) {
+			if containsURL(full, ForceRedirectOnUrlContains) {
 
-				zlog.Info().Str("Url", full).Msg("Force redirect")
+				zlog.Info().
+					Str("from_url", full).
+					Str("raw_query", rawQuery).
+					Msg("Force redirect")
 
 				req.URL.Scheme = "http"
 				req.URL.Host = *redirectHost
+				req.URL.RawQuery = rawQuery
+				req.RequestURI = ""
+				zlog.Info().Str("to_url", req.URL.String()).Msg("Force redirected")
 				return req, nil
 			}
 
-			zlog.Info().Str("Host", host).Msg("Redirect domain")
+			zlog.Info().
+				Str("host", host).
+				Str("from_url", full).
+				Str("raw_query", rawQuery).
+				Msg("Redirect domain")
 			req.URL.Scheme = "http"
 			req.URL.Host = *redirectHost
+			req.URL.RawQuery = rawQuery
+			req.RequestURI = ""
+			zlog.Info().Str("to_url", req.URL.String()).Msg("Redirected domain")
 			return req, nil
 		}
 
@@ -145,7 +196,7 @@ func main() {
 	}
 	go func() {
 		zlog.Info().
-			Str("ProxyAddress", proxyAddr).
+			Str("ProxyAddress", proxyEndpoint).
 			Str("RedirectTo", *redirectHost).
 			Str("BlockedPorts", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(blockedPorts)), ","), "[]")).
 			Str("ExePath", *exePath).

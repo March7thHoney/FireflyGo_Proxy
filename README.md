@@ -10,6 +10,7 @@ A lightweight HTTP/HTTPS proxy server with domain redirection and request blocki
 - Automatic certificate management
 - Cross-platform support (Windows, macOS, Linux)
 - System proxy configuration
+- Automatic admin prompt on macOS/Linux for certificate/proxy setup
 
 ## Installation
 
@@ -38,6 +39,7 @@ go build
 
 - `-r`: Redirect target host (default: "127.0.0.1:21000")
 - `-b`: Comma-separated list of blocked ports
+- `-p`: Proxy listen port (default: auto)
 - `-e`: Path to an executable to run with admin privileges
 
 ### Examples
@@ -65,6 +67,14 @@ go build
    ./firefly-proxy -e "/path/to/your/executable" //linux|macos
    ./firefly-proxy.exe -e "/path/to/your/executable" //windows
    ```
+
+5. Start proxy on a specific port:
+   ```bash
+   ./firefly-proxy -p 8888 //linux|macos
+   ./firefly-proxy.exe -p 8888 //windows
+   ```
+
+   On macOS/Linux, if the proxy is not already running as root, it relaunches with an administrator prompt. On Linux, logs from the elevated process are written to `/tmp/firefly-go-proxy.log`; on macOS, elevated process output is discarded.
 
 ## How it works
 

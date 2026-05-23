@@ -26,6 +26,15 @@ func matchURL(url string, list []string) bool {
 	return false
 }
 
+func containsURL(url string, list []string) bool {
+	for _, u := range list {
+		if strings.Contains(url, u) {
+			return true
+		}
+	}
+	return false
+}
+
 func cleanHost(h string) string {
 	if idx := strings.LastIndex(h, ":"); idx != -1 {
 		return h[:idx]
