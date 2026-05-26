@@ -41,6 +41,7 @@ go build
 - `-b`: Comma-separated list of blocked ports
 - `-p`: Proxy listen port (default: auto)
 - `-e`: Path to an executable to run with admin privileges
+- `-no-sys`: Run only the proxy server; skip certificate installation, system proxy setup, and macOS/Linux admin relaunch
 
 ### Examples
 
@@ -75,6 +76,12 @@ go build
    ```
 
    On macOS/Linux, if the proxy is not already running as root, it relaunches with an administrator prompt. On Linux, logs from the elevated process are written to `/tmp/firefly-go-proxy.log`; on macOS, elevated process output is discarded.
+
+6. Start only the proxy server without changing system settings:
+   ```bash
+   ./firefly-proxy -no-sys -p 8888 //linux|macos
+   ./firefly-proxy.exe -no-sys -p 8888 //windows
+   ```
 
 ## How it works
 

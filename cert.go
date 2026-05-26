@@ -10,7 +10,11 @@ import (
 
 const caCertName = "firefly-go-proxy-ca.crt"
 
-func setupCertificate() (*tls.Certificate, error) {
+func setupCertificate(installSystemCA bool) (*tls.Certificate, error) {
+	if !installSystemCA {
+		return &goproxy.GoproxyCa, nil
+	}
+
 	if _, err := os.Stat(caCertName); os.IsNotExist(err) {
 		if err := os.WriteFile(caCertName, goproxy.GoproxyCa.Certificate[0], 0644); err != nil {
 			return nil, err

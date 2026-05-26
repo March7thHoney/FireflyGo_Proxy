@@ -38,16 +38,19 @@ func main() {
 	proxyPort := flag.Int("p", 0, "proxy listen port (default: auto)")
 	exePath := flag.String("e", "", "path to the executable")
 	parentPID := flag.Int("parent-pid", 0, "parent process id to watch")
+	noSys := flag.Bool("no-sys", false, "skip certificate installation and system proxy setup")
 	flag.Parse()
 
-	relaunched, err := relaunchWithAdminIfNeeded()
-	if err != nil {
-		zlog.Error().Err(err).Msg("Failed to relaunch with admin privileges")
-		return
-	}
-	if relaunched {
-		zlog.Info().Msg("Relaunched with admin privileges")
-		return
+	if !*noSys {
+		relaunched, err := relaunchWithAdminIfNeeded()
+		if err != nil {
+			zlog.Error().Err(err).Msg("Failed to relaunch with admin privileges")
+			return
+		}
+		if relaunched {
+			zlog.Info().Msg("Relaunched with admin privileges")
+			return
+		}
 	}
 
 	blockedPorts := parseBlockedPorts(*blockedStr)
@@ -66,7 +69,7 @@ func main() {
 		return
 	}
 
-	cert, err := setupCertificate()
+	cert, err := setupCertificate(!*noSys)
 	if err != nil {
 		zlog.Error().Err(err).Msg("Failed setup certificate")
 		return
@@ -74,29 +77,30 @@ func main() {
 	addr := ":" + port
 	proxyAddr := "127.0.0.1"
 	proxyEndpoint := proxyAddr + ":" + port
-	proxyEnabled := false
-	stopProxyRefresh := func() {}
 
 	defer func() {
-		stopProxyRefresh()
 		if r := recover(); r != nil {
 			zlog.Error().
 				Interface("panic", r).
 				Msg("Unexpected panic")
 		}
-		if proxyEnabled {
+	}()
+
+	if !*noSys {
+		if err := setProxy(true, proxyAddr, port); err != nil {
+			zlog.Error().Err(err).Msg("Failed to set system proxy")
+			return
+		}
+		stopProxyRefresh := startProxyRefreshLoop(proxyAddr, port)
+		defer func() {
+			stopProxyRefresh()
 			if err := setProxy(false, "", ""); err != nil {
 				zlog.Error().Err(err).Msg("Failed to reset system proxy")
 			}
-		}
-	}()
-
-	if err := setProxy(true, proxyAddr, port); err != nil {
-		zlog.Error().Err(err).Msg("Failed to set system proxy")
-		return
+		}()
+	} else {
+		zlog.Info().Msg("System certificate and proxy setup skipped")
 	}
-	proxyEnabled = true
-	stopProxyRefresh = startProxyRefreshLoop(proxyAddr, port)
 
 	customCaMitm := &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(cert)}
 	var customAlwaysMitm goproxy.FuncHttpsHandler = func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
