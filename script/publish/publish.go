@@ -58,6 +58,17 @@ type CreateComponentRequest struct {
 	GameIDs     []string `json:"game_ids"`
 }
 
+type UpdateComponentRequest struct {
+	Type        *string  `json:"type,omitempty"`
+	Platform    *string  `json:"platform,omitempty"`
+	Status      *string  `json:"status,omitempty"`
+	Version     *string  `json:"version,omitempty"`
+	Description *string  `json:"description,omitempty"`
+	Hash        *string  `json:"hash,omitempty"`
+	MediaIDs    []string `json:"media_ids,omitempty"`
+	GameIDs     []string `json:"game_ids,omitempty"`
+}
+
 func readFile(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -203,25 +214,48 @@ func main() {
 		}
 		fmt.Printf("Media ID generated: %s\n", mediaID)
 
-		// Create component on the API
-		fmt.Println("Registering component on the API...")
-		reqBody := CreateComponentRequest{
-			Type:        cType,
-			Platform:    platform,
-			Status:      "ACTIVE",
-			Version:     version,
-			Description: description,
-			Hash:        &hash,
-			MediaIDs:    []string{mediaID},
-			GameIDs:     gameIDs,
+		fmt.Println("Checking if component already exists...")
+		existingID, err := findExistingComponent(apiURL, accessToken, cType, platform, version)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to check existing component: %v\n", err)
 		}
 
-		compID, err := createComponent(apiURL, accessToken, reqBody)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to register component: %v\n", err)
-			os.Exit(1)
+		var compID string
+		if existingID != "" {
+			fmt.Printf("Component already exists with ID: %s. Updating it...\n", existingID)
+			updateReq := UpdateComponentRequest{
+				Type:        &cType,
+				Platform:    &platform,
+				Description: description,
+				Hash:        &hash,
+				MediaIDs:    []string{mediaID},
+				GameIDs:     gameIDs,
+			}
+			compID, err = updateComponent(apiURL, accessToken, existingID, updateReq)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to update component: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("SUCCESS! Component updated with ID: %s for Platform: %s\n", compID, platform)
+		} else {
+			fmt.Println("Component does not exist. Registering on the API...")
+			reqBody := CreateComponentRequest{
+				Type:        cType,
+				Platform:    platform,
+				Status:      "ACTIVE",
+				Version:     version,
+				Description: description,
+				Hash:        &hash,
+				MediaIDs:    []string{mediaID},
+				GameIDs:     gameIDs,
+			}
+			compID, err = createComponent(apiURL, accessToken, reqBody)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to register component: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("SUCCESS! Component created with ID: %s for Platform: %s\n", compID, platform)
 		}
-		fmt.Printf("SUCCESS! Component created with ID: %s for Platform: %s\n", compID, platform)
 		processedCount++
 	}
 
@@ -249,8 +283,11 @@ func detectPlatformFromFilename(name string) string {
 	if strings.Contains(nameLower, "android_arm64") {
 		return "ANDROID_ARM64"
 	}
-	if strings.Contains(nameLower, "linux_x64") {
+	if strings.Contains(nameLower, "linux_x64") || strings.Contains(nameLower, "linux-amd64") || strings.Contains(nameLower, "linux-x64") {
 		return "LINUX_X64"
+	}
+	if strings.Contains(nameLower, "linux_arm64") || strings.Contains(nameLower, "linux-arm64") {
+		return "LINUX_ARM64"
 	}
 	return "WINDOWS_X64" // Fallback default
 }
@@ -474,6 +511,98 @@ func createComponent(apiURL, accessToken string, dto CreateComponentRequest) (st
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("create component failed (status %d): %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var cr CommonResponse
+	if err := json.Unmarshal(bodyBytes, &cr); err != nil {
+		return "", fmt.Errorf("failed to parse common response: %w", err)
+	}
+
+	if !cr.Status {
+		return "", fmt.Errorf("API error: %s", cr.Message)
+	}
+
+	var component struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(cr.Data, &component); err != nil {
+		return "", fmt.Errorf("failed to parse component data: %w", err)
+	}
+
+	return component.ID, nil
+}
+
+func findExistingComponent(apiURL, accessToken, cType, platform, version string) (string, error) {
+	u := fmt.Sprintf("%s/components?type=%s&platform=%s&search=%s",
+		apiURL, cType, platform, version)
+
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to search components (status %d): %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var pr struct {
+		Status bool `json:"status"`
+		Data   []struct {
+			ID            string `json:"id"`
+			ComponentType string `json:"component_type"`
+			Platform      string `json:"platform"`
+			Version       string `json:"version"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &pr); err != nil {
+		return "", fmt.Errorf("failed to parse components search response: %w", err)
+	}
+
+	if !pr.Status {
+		return "", fmt.Errorf("search components returned unsuccessful status")
+	}
+
+	for _, item := range pr.Data {
+		if item.ComponentType == cType && item.Platform == platform && item.Version == version {
+			return item.ID, nil
+		}
+	}
+
+	return "", nil
+}
+
+func updateComponent(apiURL, accessToken, id string, dto UpdateComponentRequest) (string, error) {
+	url := fmt.Sprintf("%s/components/%s", apiURL, id)
+
+	payload, _ := json.Marshal(dto)
+
+	req, err := http.NewRequest("PUT", url, bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("update component failed (status %d): %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var cr CommonResponse
