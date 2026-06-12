@@ -1,4 +1,4 @@
 # Changelog
 
 ### UPDATE
-- Fix bug in macos
+- Support linux, macos, window

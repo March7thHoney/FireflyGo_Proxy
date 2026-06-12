@@ -9,10 +9,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+)
+
+const (
+	apiRequestTimeout = 45 * time.Second
+	maxHTTPAttempts   = 5
 )
 
 // API responses structures
@@ -83,7 +90,7 @@ func main() {
 	gameIdsFlag := flag.String("game-ids", "", "Comma-separated Game IDs (defaults to ENV_GAME_IDS)")
 	filesFlag := flag.String("files", "", "Comma-separated list of files to upload (defaults to scanning prebuild/)")
 	cTypeFlag := flag.String("type", "", "Component type: LAUNCHER, PROXY, SERVER (defaults to ENV_COMPONENT_TYPE or PROXY)")
-	
+
 	flag.Parse()
 
 	// 1. Resolve settings from Env or Flags
@@ -324,24 +331,93 @@ func getFileInfoAndHash(path string) (int64, string, error) {
 	return stat.Size(), hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
+func apiEndpoint(apiURL, path string) string {
+	return strings.TrimRight(apiURL, "/") + path
+}
+
+func retryDelay(attempt int) time.Duration {
+	delay := time.Duration(1<<uint(attempt-1)) * time.Second
+	if delay > 20*time.Second {
+		return 20 * time.Second
+	}
+	return delay
+}
+
+func isRetryableStatus(statusCode int) bool {
+	return statusCode == http.StatusRequestTimeout ||
+		statusCode == http.StatusTooEarly ||
+		statusCode == http.StatusTooManyRequests ||
+		statusCode >= http.StatusInternalServerError
+}
+
+func isAccepted(statusCode int, accepted ...int) bool {
+	for _, code := range accepted {
+		if statusCode == code {
+			return true
+		}
+	}
+	return false
+}
+
+func doHTTPWithRetry(label string, client *http.Client, buildRequest func() (*http.Request, error), accepted ...int) ([]byte, int, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxHTTPAttempts; attempt++ {
+		req, err := buildRequest()
+		if err != nil {
+			return nil, 0, err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < maxHTTPAttempts {
+				delay := retryDelay(attempt)
+				fmt.Fprintf(os.Stderr, "%s attempt %d/%d failed: %v. Retrying in %s...\n", label, attempt, maxHTTPAttempts, err, delay)
+				time.Sleep(delay)
+				continue
+			}
+			return nil, 0, err
+		}
+
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, resp.StatusCode, readErr
+		}
+
+		if isAccepted(resp.StatusCode, accepted...) {
+			return bodyBytes, resp.StatusCode, nil
+		}
+
+		if !isRetryableStatus(resp.StatusCode) || attempt == maxHTTPAttempts {
+			return bodyBytes, resp.StatusCode, nil
+		}
+
+		lastErr = fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		delay := retryDelay(attempt)
+		fmt.Fprintf(os.Stderr, "%s attempt %d/%d returned %v. Retrying in %s...\n", label, attempt, maxHTTPAttempts, lastErr, delay)
+		time.Sleep(delay)
+	}
+
+	return nil, 0, lastErr
+}
+
 func refreshRobotToken(apiURL, robotToken string) (string, error) {
-	url := fmt.Sprintf("%s/robot-tokens/refresh", apiURL)
-	req, err := http.NewRequest("POST", url, nil)
+	endpoint := apiEndpoint(apiURL, "/robot-tokens/refresh")
+	client := &http.Client{Timeout: apiRequestTimeout}
+	bodyBytes, statusCode, err := doHTTPWithRetry("refresh robot token", client, func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+robotToken)
+		return req, nil
+	}, http.StatusOK)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+robotToken)
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("refresh token failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+	if statusCode != http.StatusOK {
+		return "", fmt.Errorf("refresh token failed with status %d: %s", statusCode, string(bodyBytes))
 	}
 
 	var cr CommonResponse
@@ -362,25 +438,30 @@ func refreshRobotToken(apiURL, robotToken string) (string, error) {
 }
 
 func getPresignedURL(apiURL, accessToken, fileName, contentType string, size int64) (*PreSignedResponse, error) {
-	u := fmt.Sprintf("%s/media/presigned?fileName=%s&content_type=%s&size=%d",
-		apiURL, fileName, contentType, size)
-
-	req, err := http.NewRequest("GET", u, nil)
+	endpoint, err := url.Parse(apiEndpoint(apiURL, "/media/presigned"))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	query := endpoint.Query()
+	query.Set("fileName", fileName)
+	query.Set("content_type", contentType)
+	query.Set("size", strconv.FormatInt(size, 10))
+	endpoint.RawQuery = query.Encode()
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	client := &http.Client{Timeout: apiRequestTimeout}
+	bodyBytes, statusCode, err := doHTTPWithRetry("get presigned URL", client, func() (*http.Request, error) {
+		req, err := http.NewRequest("GET", endpoint.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		return req, nil
+	}, http.StatusOK)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to get presigned URL (status %d): %s", resp.StatusCode, string(bodyBytes))
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get presigned URL (status %d): %s", statusCode, string(bodyBytes))
 	}
 
 	var cr CommonResponse
@@ -443,7 +524,7 @@ func uploadFileToS3(path string, presigned *PreSignedResponse) error {
 }
 
 func completePreSignedUpload(apiURL, accessToken, tokenID, hash string) (string, error) {
-	url := fmt.Sprintf("%s/media/presigned/complete", apiURL)
+	endpoint := apiEndpoint(apiURL, "/media/presigned/complete")
 
 	metaJSON, _ := json.Marshal(map[string]string{"sha256": hash})
 	dto := PreSignedCompleteDto{
@@ -453,23 +534,21 @@ func completePreSignedUpload(apiURL, accessToken, tokenID, hash string) (string,
 
 	payload, _ := json.Marshal(dto)
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	client := &http.Client{Timeout: apiRequestTimeout}
+	bodyBytes, statusCode, err := doHTTPWithRetry("complete presigned upload", client, func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}, http.StatusOK)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("complete upload failed (status %d): %s", resp.StatusCode, string(bodyBytes))
+	if statusCode != http.StatusOK {
+		return "", fmt.Errorf("complete upload failed (status %d): %s", statusCode, string(bodyBytes))
 	}
 
 	var cr CommonResponse
@@ -490,27 +569,25 @@ func completePreSignedUpload(apiURL, accessToken, tokenID, hash string) (string,
 }
 
 func createComponent(apiURL, accessToken string, dto CreateComponentRequest) (string, error) {
-	url := fmt.Sprintf("%s/components", apiURL)
+	endpoint := apiEndpoint(apiURL, "/components")
 
 	payload, _ := json.Marshal(dto)
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	client := &http.Client{Timeout: apiRequestTimeout}
+	bodyBytes, statusCode, err := doHTTPWithRetry("create component", client, func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}, http.StatusCreated, http.StatusOK)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("create component failed (status %d): %s", resp.StatusCode, string(bodyBytes))
+	if statusCode != http.StatusCreated && statusCode != http.StatusOK {
+		return "", fmt.Errorf("create component failed (status %d): %s", statusCode, string(bodyBytes))
 	}
 
 	var cr CommonResponse
@@ -533,25 +610,30 @@ func createComponent(apiURL, accessToken string, dto CreateComponentRequest) (st
 }
 
 func findExistingComponent(apiURL, accessToken, cType, platform, version string) (string, error) {
-	u := fmt.Sprintf("%s/components?type=%s&platform=%s&search=%s",
-		apiURL, cType, platform, version)
-
-	req, err := http.NewRequest("GET", u, nil)
+	endpoint, err := url.Parse(apiEndpoint(apiURL, "/components"))
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	query := endpoint.Query()
+	query.Set("type", cType)
+	query.Set("platform", platform)
+	query.Set("search", version)
+	endpoint.RawQuery = query.Encode()
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	client := &http.Client{Timeout: apiRequestTimeout}
+	bodyBytes, statusCode, err := doHTTPWithRetry("search existing component", client, func() (*http.Request, error) {
+		req, err := http.NewRequest("GET", endpoint.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		return req, nil
+	}, http.StatusOK)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to search components (status %d): %s", resp.StatusCode, string(bodyBytes))
+	if statusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to search components (status %d): %s", statusCode, string(bodyBytes))
 	}
 
 	var pr struct {
@@ -582,27 +664,25 @@ func findExistingComponent(apiURL, accessToken, cType, platform, version string)
 }
 
 func updateComponent(apiURL, accessToken, id string, dto UpdateComponentRequest) (string, error) {
-	url := fmt.Sprintf("%s/components/%s", apiURL, id)
+	endpoint := apiEndpoint(apiURL, "/components/"+url.PathEscape(id))
 
 	payload, _ := json.Marshal(dto)
 
-	req, err := http.NewRequest("PUT", url, bytes.NewReader(payload))
+	client := &http.Client{Timeout: apiRequestTimeout}
+	bodyBytes, statusCode, err := doHTTPWithRetry("update component", client, func() (*http.Request, error) {
+		req, err := http.NewRequest("PUT", endpoint, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}, http.StatusOK)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("update component failed (status %d): %s", resp.StatusCode, string(bodyBytes))
+	if statusCode != http.StatusOK {
+		return "", fmt.Errorf("update component failed (status %d): %s", statusCode, string(bodyBytes))
 	}
 
 	var cr CommonResponse

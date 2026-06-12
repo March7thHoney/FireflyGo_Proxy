@@ -23,6 +23,10 @@ var AlwaysIgnoreDomains = []string{
 	"autopatchos.starrails.com",
 }
 
+var AlwaysIgnoreUrls = []string{
+	"/query_security_file",
+}
+
 var BlockUrls = []string{
 	"/data_abtest_api/config/experiment/list",
 	"/common/hkrpg_global/announcement/api/getAlertPic",

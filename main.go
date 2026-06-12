@@ -136,6 +136,11 @@ func main() {
 			return req, nil
 		}
 
+		if matchURL(path, AlwaysIgnoreUrls) {
+			zlog.Warn().Str("url", req.URL.String()).Msg("PASS URL")
+			return req, nil
+		}
+
 		if matchDomain(host, RedirectDomains) {
 			if matchURL(path, BlockUrls) {
 				full := req.URL.String()
