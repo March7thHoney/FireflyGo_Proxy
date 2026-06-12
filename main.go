@@ -141,6 +141,17 @@ func main() {
 			return req, nil
 		}
 
+		if matchURL(path, EmptyUrls) {
+			full := req.URL.String()
+			zlog.Warn().Str("url", full).Msg("Empty URL Response")
+			return req, goproxy.NewResponse(
+				req,
+				goproxy.ContentTypeText,
+				http.StatusOK,
+				"",
+			)
+		}
+
 		if matchDomain(host, RedirectDomains) {
 			if matchURL(path, BlockUrls) {
 				full := req.URL.String()

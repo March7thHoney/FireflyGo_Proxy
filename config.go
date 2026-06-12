@@ -23,7 +23,9 @@ var AlwaysIgnoreDomains = []string{
 	"autopatchos.starrails.com",
 }
 
-var AlwaysIgnoreUrls = []string{
+var AlwaysIgnoreUrls = []string{}
+
+var EmptyUrls = []string{
 	"/query_security_file",
 }
 
