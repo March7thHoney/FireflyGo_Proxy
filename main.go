@@ -147,7 +147,7 @@ func main() {
 			return req, goproxy.NewResponse(
 				req,
 				goproxy.ContentTypeText,
-				http.StatusOK,
+				http.StatusNotFound,
 				"",
 			)
 		}
@@ -160,7 +160,7 @@ func main() {
 					req,
 					goproxy.ContentTypeText,
 					http.StatusNotFound,
-					`{\n"message": "blocked by proxy",\n,"success": false,\n"retcode": -1\n}`,
+					`{"message": "blocked by proxy", "success": false, "retcode": -1}`,
 				)
 			}
 			full := req.URL.String()
