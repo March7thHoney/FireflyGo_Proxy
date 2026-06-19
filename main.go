@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -32,14 +34,26 @@ func rawQueryFromRequestURI(requestURI string) string {
 	return rawQuery
 }
 
+// parseRedirect accepts a bare host:port (defaults to http) or a full URL like https://march7th.hoyotoon.com, returning the scheme and host to forward to.
+func parseRedirect(r string) (scheme, host string) {
+	if strings.Contains(r, "://") {
+		if u, err := url.Parse(r); err == nil && u.Host != "" {
+			return u.Scheme, u.Host
+		}
+	}
+	return "http", r
+}
+
 func main() {
-	redirectHost := flag.String("r", "127.0.0.1:21000", "redirect target host")
+	redirectHost := flag.String("r", "127.0.0.1:21000", "redirect target (host:port or full URL)")
 	blockedStr := flag.String("b", "", "comma separated list of blocked ports")
 	proxyPort := flag.Int("p", 0, "proxy listen port (default: auto)")
 	exePath := flag.String("e", "", "path to the executable")
 	parentPID := flag.Int("parent-pid", 0, "parent process id to watch")
 	noSys := flag.Bool("no-sys", false, "skip certificate installation and system proxy setup")
 	flag.Parse()
+
+	redirectScheme, redirectTarget := parseRedirect(*redirectHost)
 
 	if !*noSys {
 		relaunched, err := relaunchWithAdminIfNeeded()
@@ -119,6 +133,8 @@ func main() {
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
+		// Forward to https targets (e.g. the online edge) without verifying its cert, to allow self-signed/edge certs.
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	proxy.CertStore = NewCertStorage()
 	proxy.OnRequest().HandleConnect(customAlwaysMitm)
@@ -171,8 +187,9 @@ func main() {
 					Str("raw_query", rawQuery).
 					Msg("Force redirect")
 
-				req.URL.Scheme = "http"
-				req.URL.Host = *redirectHost
+				req.URL.Scheme = redirectScheme
+				req.URL.Host = redirectTarget
+				req.Host = redirectTarget
 				req.URL.RawQuery = rawQuery
 				req.RequestURI = ""
 				zlog.Info().Str("to_url", req.URL.String()).Msg("Force redirected")
@@ -184,8 +201,9 @@ func main() {
 				Str("from_url", full).
 				Str("raw_query", rawQuery).
 				Msg("Redirect domain")
-			req.URL.Scheme = "http"
-			req.URL.Host = *redirectHost
+			req.URL.Scheme = redirectScheme
+			req.URL.Host = redirectTarget
+			req.Host = redirectTarget
 			req.URL.RawQuery = rawQuery
 			req.RequestURI = ""
 			zlog.Info().Str("to_url", req.URL.String()).Msg("Redirected domain")
