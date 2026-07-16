@@ -42,6 +42,7 @@ go build
 - `-p`: Proxy listen port (default: auto)
 - `-e`: Path to an executable to run with admin privileges
 - `-no-sys`: Run only the proxy server; skip certificate installation, system proxy setup, and macOS/Linux admin relaunch
+- `-filter-only`: Apply configured URL filters without redirecting matching domains
 
 ### Examples
 
@@ -83,6 +84,12 @@ go build
    ./firefly-proxy.exe -no-sys -p 8888 //windows
    ```
 
+7. Apply URL filters without redirecting domains:
+   ```bash
+   ./firefly-proxy -no-sys -filter-only -p 8888 //linux|macos
+   ./firefly-proxy.exe -no-sys -filter-only -p 8888 //windows
+   ```
+
 ## How it works
 
 The proxy intercepts HTTP/HTTPS traffic and can:
@@ -94,5 +101,4 @@ The proxy intercepts HTTP/HTTPS traffic and can:
 ## License
 
 MIT License
-
 

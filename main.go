@@ -51,6 +51,7 @@ func main() {
 	exePath := flag.String("e", "", "path to the executable")
 	parentPID := flag.Int("parent-pid", 0, "parent process id to watch")
 	noSys := flag.Bool("no-sys", false, "skip certificate installation and system proxy setup")
+	filterOnly := flag.Bool("filter-only", false, "apply URL filters without redirecting domains")
 	flag.Parse()
 
 	redirectScheme, redirectTarget := parseRedirect(*redirectHost)
@@ -168,6 +169,11 @@ func main() {
 			)
 		}
 
+		if *filterOnly {
+			zlog.Warn().Str("url", req.URL.String()).Msg("PASS URL")
+			return req, nil
+		}
+
 		if matchDomain(host, RedirectDomains) {
 			if matchURL(path, BlockUrls) {
 				full := req.URL.String()
@@ -245,6 +251,7 @@ func main() {
 			Str("RedirectTo", *redirectHost).
 			Str("BlockedPorts", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(blockedPorts)), ","), "[]")).
 			Str("ExePath", *exePath).
+			Bool("FilterOnly", *filterOnly).
 			Msg("Proxy started")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			serverErr <- err
