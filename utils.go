@@ -42,6 +42,15 @@ func cleanHost(h string) string {
 	return h
 }
 
+func shouldTunnelWithoutMITM(host string) bool {
+	return matchDomain(strings.ToLower(cleanHost(host)), AlwaysIgnoreDomains)
+}
+
+func shouldMitmHost(host string) bool {
+	domain := strings.ToLower(cleanHost(host))
+	return !matchDomain(domain, AlwaysIgnoreDomains) && matchDomain(domain, RedirectDomains)
+}
+
 func findFreePort(blocked []int) string {
 	for {
 		ln, err := net.Listen("tcp", ":0")

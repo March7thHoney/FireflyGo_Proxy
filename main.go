@@ -120,7 +120,11 @@ func main() {
 	customCaMitm := &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(cert)}
 	var customAlwaysMitm goproxy.FuncHttpsHandler = func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
 		domain := cleanHost(host)
-		if matchDomain(domain, RedirectDomains) {
+		if shouldTunnelWithoutMITM(domain) {
+			zlog.Info().Str("host", domain).Msg("TUNNEL CONNECT")
+			return goproxy.OkConnect, host
+		}
+		if shouldMitmHost(domain) {
 			return customCaMitm, host
 		}
 		return goproxy.OkConnect, host
