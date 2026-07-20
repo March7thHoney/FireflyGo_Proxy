@@ -89,9 +89,9 @@ func main() {
 		zlog.Error().Err(err).Msg("Failed setup certificate")
 		return
 	}
-	addr := ":" + port
 	proxyAddr := "127.0.0.1"
 	proxyEndpoint := proxyAddr + ":" + port
+	addr := proxyEndpoint
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -150,6 +150,9 @@ func main() {
 		rawQuery := req.URL.RawQuery
 		if rawQuery == "" {
 			rawQuery = rawQueryFromRequestURI(req.RequestURI)
+		}
+		if resp, ok := serveResourceBridge(req, proxyEndpoint); ok {
+			return req, resp
 		}
 
 		if matchDomain(host, AlwaysIgnoreDomains) {
@@ -223,10 +226,13 @@ func main() {
 		zlog.Warn().Str("url", req.URL.String()).Msg("PASS URL")
 		return req, nil
 	})
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		return rewriteGatewayResponse(resp, proxyEndpoint)
+	})
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           proxy,
+		Handler:           resourceBridgeHandler(proxy, proxyEndpoint),
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,
