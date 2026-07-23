@@ -147,6 +147,7 @@ func main() {
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		host := req.URL.Hostname()
 		path := req.URL.Path
+		forceGatewayIdentityEncoding(req)
 		rawQuery := req.URL.RawQuery
 		if rawQuery == "" {
 			rawQuery = rawQueryFromRequestURI(req.RequestURI)
