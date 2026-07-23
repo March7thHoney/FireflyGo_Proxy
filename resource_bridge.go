@@ -2,7 +2,11 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,6 +41,35 @@ var resourceBridgeTransport = &http.Transport{
 	IdleConnTimeout:       90 * time.Second,
 	TLSHandshakeTimeout:   15 * time.Second,
 	ResponseHeaderTimeout: 30 * time.Second,
+}
+
+var resourceBridgeRetryDelays = []time.Duration{0, 200 * time.Millisecond, 500 * time.Millisecond}
+
+var resourceBridgeClient = &http.Client{
+	Transport: resourceBridgeTransport,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("resource bridge redirect limit exceeded")
+		}
+		if !isAllowedResourceURL(req.URL) {
+			return fmt.Errorf("resource bridge rejected redirect to %s", req.URL.Redacted())
+		}
+		return nil
+	},
+}
+
+func isAllowedResourceURL(target *url.URL) bool {
+	if target == nil || !strings.EqualFold(target.Scheme, "https") {
+		return false
+	}
+	host := strings.ToLower(target.Hostname())
+	for _, spec := range resourceBridgeSpecs {
+		source, err := url.Parse(spec.sourcePrefix)
+		if err == nil && host == strings.ToLower(source.Hostname()) {
+			return true
+		}
+	}
+	return false
 }
 
 func resourceBridgePrefix(spec resourceBridgeSpec, proxyEndpoint string) (string, bool) {
@@ -82,26 +115,68 @@ func rewriteGatewayResourceURLs(body []byte, proxyEndpoint string) ([]byte, bool
 	return result, true
 }
 
+func forceGatewayIdentityEncoding(req *http.Request) {
+	if req != nil && req.URL != nil && req.URL.Path == "/query_gateway" {
+		req.Header.Set("Accept-Encoding", "identity")
+	}
+}
+
+func decodeGatewayBody(body []byte, encoding string) ([]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "", "identity":
+		return body, nil
+	case "gzip":
+		reader, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+		return io.ReadAll(reader)
+	case "deflate":
+		reader, err := zlib.NewReader(bytes.NewReader(body))
+		if err == nil {
+			defer reader.Close()
+			return io.ReadAll(reader)
+		}
+		rawReader := flate.NewReader(bytes.NewReader(body))
+		defer rawReader.Close()
+		return io.ReadAll(rawReader)
+	default:
+		return nil, fmt.Errorf("unsupported gateway content encoding %q", encoding)
+	}
+}
+
 func rewriteGatewayResponse(resp *http.Response, proxyEndpoint string) *http.Response {
 	if resp == nil || resp.Request == nil || resp.Request.URL == nil || resp.Request.URL.Path != "/query_gateway" || resp.Body == nil {
 		return resp
 	}
-	if resp.Header.Get("Content-Encoding") != "" {
-		return resp
-	}
-	body, err := io.ReadAll(resp.Body)
+	encoding := resp.Header.Get("Content-Encoding")
+	rawBody, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.Body = io.NopCloser(bytes.NewReader(rawBody))
+		return resp
+	}
+	body, err := decodeGatewayBody(rawBody, encoding)
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(rawBody))
+		zlog.Warn().Str("encoding", encoding).Err(err).Msg("RESOURCE URL REWRITE SKIPPED")
 		return resp
 	}
 	rewritten, changed := rewriteGatewayResourceURLs(body, proxyEndpoint)
+	if !changed {
+		resp.Body = io.NopCloser(bytes.NewReader(rawBody))
+		zlog.Info().Str("encoding", encoding).Bool("changed", false).Msg("RESOURCE URL REWRITE")
+		return resp
+	}
 	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
 	resp.ContentLength = int64(len(rewritten))
 	resp.Header.Set("Content-Length", fmt.Sprint(len(rewritten)))
-	if changed {
-		zlog.Info().Str("url", resp.Request.URL.String()).Msg("REWRITE RESOURCE URLS")
-	}
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Transfer-Encoding")
+	resp.TransferEncoding = nil
+	resp.Uncompressed = false
+	zlog.Info().Str("encoding", encoding).Bool("changed", true).Msg("REWRITE RESOURCE URLS")
 	return resp
 }
 
@@ -155,14 +230,58 @@ func serveResourceBridge(req *http.Request, proxyEndpoint string) (*http.Respons
 	upReq.Header = req.Header.Clone()
 	upReq.Header.Del("Proxy-Connection")
 	upReq.Header.Del("Connection")
-	resp, err := resourceBridgeTransport.RoundTrip(upReq)
+	started := time.Now()
+	resp, attempts, err := doResourceBridgeRequest(upReq)
 	if err != nil {
-		zlog.Error().Err(err).Str("url", target).Msg("RESOURCE BRIDGE FAILED")
+		zlog.Error().Err(err).
+			Str("host", upstream.Hostname()).
+			Str("path", upstream.EscapedPath()).
+			Str("method", req.Method).
+			Str("range", req.Header.Get("Range")).
+			Int("attempts", attempts).
+			Dur("elapsed", time.Since(started)).
+			Msg("RESOURCE BRIDGE FAILED")
 		return goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusBadGateway, "resource bridge failed"), true
 	}
 	resp.Request = req
-	zlog.Info().Str("url", target).Int("status", resp.StatusCode).Msg("RESOURCE BRIDGE")
+	zlog.Info().
+		Str("host", upstream.Hostname()).
+		Str("path", upstream.EscapedPath()).
+		Str("method", req.Method).
+		Str("range", req.Header.Get("Range")).
+		Int("attempts", attempts).
+		Int("status", resp.StatusCode).
+		Dur("elapsed", time.Since(started)).
+		Msg("RESOURCE BRIDGE")
 	return resp, true
+}
+
+func doResourceBridgeRequest(req *http.Request) (*http.Response, int, error) {
+	var lastErr error
+	for attempt, delay := range resourceBridgeRetryDelays {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-req.Context().Done():
+				timer.Stop()
+				return nil, attempt, req.Context().Err()
+			case <-timer.C:
+			}
+		}
+		attemptReq := req.Clone(req.Context())
+		resp, err := resourceBridgeClient.Do(attemptReq)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if (resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && attempt+1 < len(resourceBridgeRetryDelays) {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("upstream returned %s", resp.Status)
+			continue
+		}
+		return resp, attempt + 1, nil
+	}
+	return nil, len(resourceBridgeRetryDelays), lastErr
 }
 
 func resourceBridgeHandler(next http.Handler, proxyEndpoint string) http.Handler {
@@ -183,7 +302,8 @@ func resourceBridgeHandler(next http.Handler, proxyEndpoint string) http.Handler
 		}
 		w.WriteHeader(resp.StatusCode)
 		if req.Method != http.MethodHead && resp.Body != nil {
-			_, _ = io.Copy(w, resp.Body)
+			written, err := io.Copy(w, resp.Body)
+			zlog.Info().Int64("bytes", written).Err(err).Msg("RESOURCE BRIDGE BODY")
 		}
 	})
 }
